@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS Trajectory Map Matching and Route Recovery</title>
+<style>
+*{box-sizing:border-box}
+:root{font-family:system-ui,sans-serif;color:#172b30;background:#f1f5f4;line-height:1.5}
+body{margin:0}header{background:#112f33;color:#fff;padding:32px max(22px,calc((100vw - 1250px)/2)) 36px;border-bottom:4px solid #58cbad}
+.brand{font-size:13px;font-weight:800;letter-spacing:.19em;color:#8be3cd}.brand span{color:#b6cbc9;font-weight:500;margin-left:14px;letter-spacing:.1em}
+h1{font-size:clamp(2rem,4.4vw,3.7rem);line-height:1.05;letter-spacing:-.055em;margin:17px 0 10px}header p{margin:0;color:#c3d9d6}
+main{max-width:1294px;margin:auto;padding:22px 22px 48px}.workspace{display:grid;grid-template-columns:270px minmax(0,1fr);gap:16px}
+.card{padding:19px;background:white;border:1px solid #d7e1df;border-radius:14px;min-width:0}h2{margin:0 0 7px;font-size:1.18rem;letter-spacing:-.025em}h3{margin:0;font-size:.9rem}p{margin:0;color:#52646a;font-size:.9rem}
+label{font-size:.84rem;font-weight:650;display:block}aside label{margin:10px 0}input,select,button{font:inherit}input[type=number],input[type=file],select{display:block;width:100%;margin-top:3px;padding:6px 8px;border:1px solid #bacbc9;border-radius:6px;background:#fff;color:inherit}
+button{border:1px solid transparent;border-radius:7px;padding:8px 12px;cursor:pointer;font-weight:700;font-size:.83rem;white-space:nowrap}button:disabled{opacity:.55;cursor:default}.primary{background:#116755;color:white}.secondary{background:#eef5f3;color:#19473c;border-color:#d5e4df}aside button{width:100%}.method{border-top:1px solid #e0e8e6;padding-top:10px}summary{cursor:pointer;font-size:.85rem;font-weight:700}aside details{margin-top:13px}#status,#experiment-status{margin-top:8px}
+.split,.layers{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.split{justify-content:space-between}.layers{margin:12px 0;font-size:.84rem}.layers label,.layers span{display:flex;align-items:center;gap:5px}.layers i{display:inline-block;width:16px;height:4px;border-radius:5px}.roads{background:#a6b6ba}.truth{background:#158463}.raw{background:#ba4b2d}.nearest{background:#8256bd}.hmm{background:#1664cb}.residual{background:#91a1a9}
+#map{display:block;width:100%;background:#f7faf9;border-radius:9px;border:1px solid #e0e9e6}circle[role=button]{cursor:pointer}.inspect{margin-top:8px}.inspect label{display:flex;align-items:center;gap:10px}.inspect input{max-width:65%;width:270px}
+.results,.experiments{margin-top:16px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:.83rem}th,td{padding:7px 10px;text-align:left;border-bottom:1px solid #e1e8e7;white-space:nowrap}th{background:#eff5f4}#routes{margin:12px 0;overflow-wrap:anywhere}#routes p{margin:4px 0}.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.chart-grid svg{width:100%}#chart-metric{display:inline-block;width:auto}
+@media(max-width:800px){.workspace{grid-template-columns:1fr}.chart-grid{grid-template-columns:1fr}#settings{display:grid;grid-template-columns:1fr 1fr;gap:8px}#settings button{align-self:end}}
+</style>
+<script type="module">
+const workerSource="const meters = Math.PI * 6371008.8 / 180;\nconst distance = (a,b) => Math.hypot(b.x-a.x,b.y-a.y);\nconst interpolate = (a,b,t) => ({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});\n\nfunction projection(latitude,longitude) {\n  const scale = meters * Math.cos(latitude*Math.PI/180);\n  return {\n    toXY: p => ({x:(p.longitude-longitude)*scale,y:(p.latitude-latitude)*meters}),\n    toGPS: p => ({latitude:latitude+p.y/meters,longitude:longitude+p.x/scale})\n  };\n}\n\nclass Roads {\n  constructor({nodes,edges}) {\n    if (!Array.isArray(nodes) || !Array.isArray(edges) || nodes.length<2 || !edges.length)\n      throw new Error('Provide a network with nodes and edges.');\n    const validId = id => typeof id==='string' && id.trim();\n    for (const p of nodes) {\n      if (!validId(p.id) || !Number.isFinite(p.latitude) || !Number.isFinite(p.longitude)\n          || Math.abs(p.latitude)>=89 || Math.abs(p.longitude)>180)\n        throw new Error('Invalid road node identifier or coordinates.');\n    }\n    this.frame = projection(nodes[0].latitude,nodes[0].longitude);\n    this.nodes = new Map(nodes.map(p=>[p.id,this.frame.toXY(p)]));\n    this.adjacency = new Map(nodes.map(p=>[p.id,[]]));\n    this.edges = new Map();\n    this.cache = new Map();\n    if (this.nodes.size!==nodes.length) throw new Error('Duplicate node identifier.');\n    for (const {id,from,to} of edges) {\n      const a=this.nodes.get(from), b=this.nodes.get(to);\n      if (!validId(id) || this.edges.has(id) || !a || !b || distance(a,b)<1e-6)\n        throw new Error('Invalid road edge or duplicate identifier.');\n      const edge={id,from,to,a,b,length:distance(a,b)};\n      this.edges.set(id,edge);\n      this.adjacency.get(from).push({node:to,edge});\n      this.adjacency.get(to).push({node:from,edge});\n    }\n  }\n\n  candidates(p,k) {\n    return [...this.edges.values()].map(edge=>{\n      const {a,b,length}=edge;\n      const t=Math.max(0,Math.min(1,((p.x-a.x)*(b.x-a.x)+(p.y-a.y)*(b.y-a.y))/length**2));\n      const xy=interpolate(a,b,t);\n      return {edge,xy,t,error:distance(p,xy)};\n    }).sort((a,b)=>a.error-b.error).slice(0,k);\n  }\n\n  shortestTree(source) {\n    if (this.cache.has(source)) return this.cache.get(source);\n    const lengths=new Map([[source,0]]), previous=new Map(), pending=new Set([source]);\n    while (pending.size) {\n      let current;\n      for (const node of pending) {\n        if (current===undefined || lengths.get(node)<lengths.get(current)) current=node;\n      }\n      pending.delete(current);\n      for (const {node,edge} of this.adjacency.get(current)) {\n        const length=lengths.get(current)+edge.length;\n        if (length >= (lengths.get(node) ?? Infinity)) continue;\n        lengths.set(node,length);\n        previous.set(node,{current,edge});\n        pending.add(node);\n      }\n    }\n    const tree={lengths,previous};\n    this.cache.set(source,tree);\n    return tree;\n  }\n\n  connect(a,b,geometry=false) {\n    let best=a.edge===b.edge ? {length:distance(a.xy,b.xy)} : {length:Infinity};\n    const ends=c=>[[c.edge.from,c.t*c.edge.length],[c.edge.to,(1-c.t)*c.edge.length]];\n    for (const [from,first] of ends(a)) {\n      const tree=this.shortestTree(from);\n      for (const [to,last] of ends(b)) {\n        const length=first+(tree.lengths.get(to)??Infinity)+last;\n        if (length+1e-8<best.length) best={length,from,to,first,last,tree};\n      }\n    }\n    if (!geometry || !Number.isFinite(best.length)) return best;\n    if (!best.tree) return {...best,points:[a.xy,b.xy],edges:[a.edge.id]};\n    const nodes=[best.to], edges=[];\n    for (let node=best.to; node!==best.from;) {\n      const {current,edge}=best.tree.previous.get(node);\n      edges.push(edge.id);\n      nodes.push(current);\n      node=current;\n    }\n    edges.reverse();\n    if (best.first>1e-7) edges.unshift(a.edge.id);\n    if (best.last>1e-7) edges.push(b.edge.id);\n    return {...best,edges,points:[a.xy,...nodes.reverse().map(id=>this.nodes.get(id)),b.xy]};\n  }\n}\r\n\nfunction gaussian(seed) {\n  let state=seed>>>0;\n  const uniform=()=>{\n    state=(Math.imul(state,1664525)+1013904223)>>>0;\n    return (state+1)/4294967297;\n  };\n  return ()=>Math.sqrt(-2*Math.log(uniform()))*Math.cos(2*Math.PI*uniform());\n}\n\nfunction perturb(p,sigma,normal) {\n  return {x:p.x+sigma*normal(),y:p.y+sigma*normal()};\n}\r\n\n\nconst collapse = ids => ids.filter((id,i)=>!i || ids[i-1]!==id);\n\nfunction simulate({noise=32,interval=5,count=24,complexity=6,seed=42}={}) {\n  const frame=projection(12.97,77.59);\n  const nodes=[],edges=[],lookup=new Map();\n  const id=(x,y)=>x+':'+y;\n  function add(from,to) {\n    const edge={id:'R'+(edges.length+1),from,to};\n    edges.push(edge);\n    lookup.set(from+'>'+to,edge.id);\n  }\n  for(let y=0;y<complexity;y++) for(let x=0;x<complexity;x++) {\n    nodes.push({id:id(x,y),...frame.toGPS({x:100*x,y:65*y})});\n    if(x) add(id(x-1,y),id(x,y));\n    if(y) add(id(x,y-1),id(x,y));\n  }\n  const path=[id(0,1),id(1,1),id(2,1),id(2,2),id(3,2),id(4,2),id(4,3),id(4,4)];\n  for(let x=5;x<complexity;x++) path.push(id(x,4));\n  const network={nodes,edges};\n  const roads=new Roads(network);\n  const route=path.slice(1).map((node,i)=>roads.edges.get(lookup.get(path[i]+'>'+node)));\n  const total=route.reduce((sum,e)=>sum+e.length,0);\n  const normal=gaussian(seed);\n  const observations=[],truthPoints=[],truthIds=[];\n  for(let i=0;i<count;i++) {\n    let offset=total*i/(count-1), index=0;\n    while(index<route.length-1 && offset>=route[index].length-1e-7) offset-=route[index++].length;\n    const edge=route[index];\n    const loc=interpolate(edge.a,edge.b,Math.max(0,Math.min(1,offset/edge.length)));\n    const timestamp=new Date(Date.UTC(2026,0,1)+1000*i*interval).toISOString();\n    observations.push({timestamp,...roads.frame.toGPS(perturb(loc,noise,normal))});\n    truthPoints.push({timestamp,...roads.frame.toGPS(loc)});\n    truthIds.push(edge.id);\n  }\n  return {network,roads,observations,truthPoints,truthIds,truthRoute:route.map(e=>e.id),\n    truthGeometry:path.map(node=>roads.nodes.get(node)),truthDistance:total,noise};\n}\n\nfunction parseGPS(text) {\n  const lines=text.trim().split(/\\r?\\n/);\n  const header=lines.shift().replace(/^\\uFEFF/,'').split(',').map(s=>s.trim().toLowerCase());\n  const indexes=['latitude','longitude','timestamp'].map(key=>header.indexOf(key));\n  if(indexes.includes(-1)) throw new Error('CSV requires latitude, longitude and timestamp columns.');\n  const rows=lines.filter(line=>line.trim()).map((line,i)=>{\n    const fields=line.split(',').map(s=>s.trim().replace(/^\"|\"$/g,''));\n    const [lat,lon,time]=indexes.map(j=>fields[j]);\n    const latitude=Number(lat),longitude=Number(lon);\n    const ms=/^\\d{4}-\\d\\d-\\d\\dT.+(?:Z|[+-]\\d\\d:\\d\\d)$/i.test(time??'') ? Date.parse(time) : NaN;\n    if(!lat || !lon || !Number.isFinite(latitude) || !Number.isFinite(longitude)\n       || Math.abs(latitude)>=89 || Math.abs(longitude)>180 || !Number.isFinite(ms))\n      throw new Error('Invalid coordinate or ISO 8601 timestamp on data row '+(i+1)+'.');\n    return {latitude,longitude,timestamp:new Date(ms).toISOString()};\n  });\n  if(rows.length<2 || rows.length>1000) throw new Error('Provide 2 to 1,000 GPS fixes.');\n  if(rows.some((p,i)=>i && p.timestamp<=rows[i-1].timestamp))\n    throw new Error('GPS timestamps must be strictly increasing.');\n  return rows;\n}\r\n\n\nfunction transition(roads,a,b,observed,seconds,sigma) {\n  const connected=roads.connect(a,b).length;\n  const moved=Math.hypot(observed.x,observed.y);\n  const dx=b.xy.x-a.xy.x, dy=b.xy.y-a.xy.y;\n  const snapped=Math.hypot(dx,dy);\n  const headingWeight=Math.min(1,2*moved/sigma);\n  const heading=snapped>1 && moved>1 ? headingWeight*(1-(dx*observed.x+dy*observed.y)/(snapped*moved)) : 0;\n  const excessSpeed=Math.max(0,connected-45*seconds-2*sigma);\n  return Math.abs(connected-moved)/Math.max(5,0.55*sigma)+heading+excessSpeed/20;\n}\n\nfunction viterbi(roads,rows,xy,observations,sigma) {\n  const emission=c=>0.5*(c.error/sigma)**2;\n  let costs=rows[0].map(emission);\n  const pointers=[];\n  for(let i=1;i<rows.length;i++) {\n    // Estimate local velocity across several fixes to reduce noise inflation.\n    const radius=sigma>5?2:0;\n    const lo=Math.max(0,i-1-radius), hi=Math.min(xy.length-1,i+radius);\n    const span=Date.parse(observations[hi].timestamp)-Date.parse(observations[lo].timestamp);\n    const fraction=(Date.parse(observations[i].timestamp)-Date.parse(observations[i-1].timestamp))/span;\n    const observed={x:(xy[hi].x-xy[lo].x)*fraction,y:(xy[hi].y-xy[lo].y)*fraction};\n    const seconds=(Date.parse(observations[i].timestamp)-Date.parse(observations[i-1].timestamp))/1000;\n    const previous=[];\n    const next=rows[i].map(b=>{\n      let best=Infinity, index=-1;\n      rows[i-1].forEach((a,j)=>{\n        const cost=costs[j]+transition(roads,a,b,observed,seconds,sigma);\n        if(cost<best) { best=cost; index=j; }\n      });\n      previous.push(index);\n      return best+emission(b);\n    });\n    costs=next;\n    pointers.push(previous);\n  }\n  const score=Math.min(...costs);\n  if(!Number.isFinite(score)) throw new Error('No connected path through the candidate roads.');\n  let index=costs.indexOf(score);\n  const matches=[rows.at(-1)[index]];\n  for(let i=rows.length-2;i>=0;i--) {\n    index=pointers[i][index];\n    matches.push(rows[i][index]);\n  }\n  return {matches:matches.reverse(),cost:score};\n}\n\nfunction match(roads,observations,{algorithm='hmm',sigma=25,k=8}={}) {\n  if(!['nearest','hmm'].includes(algorithm) || observations.length<2 || !(sigma>0) || !Number.isInteger(k) || k<1)\n    throw new Error('Invalid matching options or trajectory.');\n  const start=performance.now();\n  const xy=observations.map(roads.frame.toXY);\n  const rows=xy.map(p=>roads.candidates(p,algorithm==='nearest'?1:k));\n  const {matches,cost=null}=algorithm==='nearest'\n    ? {matches:rows.map(r=>r[0])} : viterbi(roads,rows,xy,observations,sigma);\n  const segments=[],parts=[[matches[0].xy]];\n  let length=0,gaps=0;\n  for(let i=1;i<matches.length;i++) {\n    const leg=roads.connect(matches[i-1],matches[i],true);\n    if(!Number.isFinite(leg.length)) {\n      gaps++;\n      parts.push([matches[i].xy]);\n      segments.push(null);\n      continue;\n    }\n    parts.at(-1).push(...leg.points.slice(1));\n    segments.push(...leg.edges);\n    length+=leg.length;\n  }\n  return {algorithm,matches,segments:collapse(segments),parts,length,gaps,cost,ms:performance.now()-start};\n}\r\n\r\n\n\nfunction editDistance(a,b) {\n  let row=Array.from({length:b.length+1},(_,i)=>i);\n  for(let i=0;i<a.length;i++) {\n    const next=[i+1];\n    for(let j=0;j<b.length;j++) {\n      next.push(Math.min(row[j+1]+1,next[j]+1,row[j]+Number(a[i]!==b[j])));\n    }\n    row=next;\n  }\n  return row.at(-1);\n}\n\nfunction evaluate(data,result) {\n  const metrics={\n    residual:result.matches.reduce((sum,p)=>sum+p.error,0)/result.matches.length,\n    distance:result.length,ms:result.ms,gaps:result.gaps\n  };\n  if(!data.truthRoute) return metrics;\n  const predicted=new Set(result.segments.filter(id=>id!==null));\n  const truth=new Set(data.truthRoute);\n  const overlap=[...truth].filter(id=>predicted.has(id)).length;\n  return {...metrics,\n    point:100*result.matches.filter((p,i)=>p.edge.id===data.truthIds[i]).length/result.matches.length,\n    recall:100*overlap/truth.size,\n    precision:predicted.size?100*overlap/predicted.size:0,\n    similarity:100*(1-editDistance(data.truthRoute,result.segments)/Math.max(data.truthRoute.length,result.segments.length)),\n    exact:Number(result.gaps===0 && JSON.stringify(data.truthRoute)===JSON.stringify(result.segments))*100\n  };\n}\n\nfunction compare(data) {\n  return ['nearest','hmm'].map(algorithm=>{\n    // Independent cold graph caches so neither algorithm gets precomputed routes.\n    const result=match(new Roads(data.network),data.observations,{algorithm,sigma:Math.max(3,data.noise)});\n    return {result,metrics:evaluate(data,result)};\n  });\n}\n\nfunction benchmark({noise=32,complexity=6,seed=42,trials=10}={}) {\n  const rows=[];\n  for(const [axis,levels] of [['noise',[0,10,20,30,45,60,80]],['interval',[2,4,6,10,15,30]]]) {\n    for(const level of levels) {\n      const interval=axis==='interval'?level:6;\n      const sigma=axis==='noise'?level:noise;\n      const tallies={nearest:{},hmm:{}};\n      for(let i=0;i<trials;i++) {\n        const data=simulate({noise:sigma,interval,count:120/interval+1,complexity,seed:seed+i});\n        for(const {result,metrics} of compare(data)) {\n          const tally=tallies[result.algorithm];\n          for(const [key,value] of Object.entries(metrics)) tally[key]=(tally[key]??0)+value/trials;\n        }\n      }\n      for(const [algorithm,metrics] of Object.entries(tallies))\n        rows.push({axis,level,algorithm,trials,noise:sigma,interval,...metrics});\n    }\n  }\n  return rows;\n}\r\n\n\nself.onmessage=({data})=>{\n  try { self.postMessage({rows:benchmark(data)}); }\n  catch(error) { self.postMessage({error:error.message}); }\n};\r\n";
+const meters = Math.PI * 6371008.8 / 180;
+const distance = (a,b) => Math.hypot(b.x-a.x,b.y-a.y);
+const interpolate = (a,b,t) => ({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});
+
+function projection(latitude,longitude) {
+  const scale = meters * Math.cos(latitude*Math.PI/180);
+  return {
+    toXY: p => ({x:(p.longitude-longitude)*scale,y:(p.latitude-latitude)*meters}),
+    toGPS: p => ({latitude:latitude+p.y/meters,longitude:longitude+p.x/scale})
+  };
+}
+
+class Roads {
+  constructor({nodes,edges}) {
+    if (!Array.isArray(nodes) || !Array.isArray(edges) || nodes.length<2 || !edges.length)
+      throw new Error('Provide a network with nodes and edges.');
+    const validId = id => typeof id==='string' && id.trim();
+    for (const p of nodes) {
+      if (!validId(p.id) || !Number.isFinite(p.latitude) || !Number.isFinite(p.longitude)
+          || Math.abs(p.latitude)>=89 || Math.abs(p.longitude)>180)
+        throw new Error('Invalid road node identifier or coordinates.');
+    }
+    this.frame = projection(nodes[0].latitude,nodes[0].longitude);
+    this.nodes = new Map(nodes.map(p=>[p.id,this.frame.toXY(p)]));
+    this.adjacency = new Map(nodes.map(p=>[p.id,[]]));
+    this.edges = new Map();
+    this.cache = new Map();
+    if (this.nodes.size!==nodes.length) throw new Error('Duplicate node identifier.');
+    for (const {id,from,to} of edges) {
+      const a=this.nodes.get(from), b=this.nodes.get(to);
+      if (!validId(id) || this.edges.has(id) || !a || !b || distance(a,b)<1e-6)
+        throw new Error('Invalid road edge or duplicate identifier.');
+      const edge={id,from,to,a,b,length:distance(a,b)};
+      this.edges.set(id,edge);
+      this.adjacency.get(from).push({node:to,edge});
+      this.adjacency.get(to).push({node:from,edge});
+    }
+  }
+
+  candidates(p,k) {
+    return [...this.edges.values()].map(edge=>{
+      const {a,b,length}=edge;
+      const t=Math.max(0,Math.min(1,((p.x-a.x)*(b.x-a.x)+(p.y-a.y)*(b.y-a.y))/length**2));
+      const xy=interpolate(a,b,t);
+      return {edge,xy,t,error:distance(p,xy)};
+    }).sort((a,b)=>a.error-b.error).slice(0,k);
+  }
+
+  shortestTree(source) {
+    if (this.cache.has(source)) return this.cache.get(source);
+    const lengths=new Map([[source,0]]), previous=new Map(), pending=new Set([source]);
+    while (pending.size) {
+      let current;
+      for (const node of pending) {
+        if (current===undefined || lengths.get(node)<lengths.get(current)) current=node;
+      }
+      pending.delete(current);
+      for (const {node,edge} of this.adjacency.get(current)) {
+        const length=lengths.get(current)+edge.length;
+        if (length >= (lengths.get(node) ?? Infinity)) continue;
+        lengths.set(node,length);
+        previous.set(node,{current,edge});
+        pending.add(node);
+      }
+    }
+    const tree={lengths,previous};
+    this.cache.set(source,tree);
+    return tree;
+  }
+
+  connect(a,b,geometry=false) {
+    let best=a.edge===b.edge ? {length:distance(a.xy,b.xy)} : {length:Infinity};
+    const ends=c=>[[c.edge.from,c.t*c.edge.length],[c.edge.to,(1-c.t)*c.edge.length]];
+    for (const [from,first] of ends(a)) {
+      const tree=this.shortestTree(from);
+      for (const [to,last] of ends(b)) {
+        const length=first+(tree.lengths.get(to)??Infinity)+last;
+        if (length+1e-8<best.length) best={length,from,to,first,last,tree};
+      }
+    }
+    if (!geometry || !Number.isFinite(best.length)) return best;
+    if (!best.tree) return {...best,points:[a.xy,b.xy],edges:[a.edge.id]};
+    const nodes=[best.to], edges=[];
+    for (let node=best.to; node!==best.from;) {
+      const {current,edge}=best.tree.previous.get(node);
+      edges.push(edge.id);
+      nodes.push(current);
+      node=current;
+    }
+    edges.reverse();
+    if (best.first>1e-7) edges.unshift(a.edge.id);
+    if (best.last>1e-7) edges.push(b.edge.id);
+    return {...best,edges,points:[a.xy,...nodes.reverse().map(id=>this.nodes.get(id)),b.xy]};
+  }
+}
+
+function gaussian(seed) {
+  let state=seed>>>0;
+  const uniform=()=>{
+    state=(Math.imul(state,1664525)+1013904223)>>>0;
+    return (state+1)/4294967297;
+  };
+  return ()=>Math.sqrt(-2*Math.log(uniform()))*Math.cos(2*Math.PI*uniform());
+}
+
+function perturb(p,sigma,normal) {
+  return {x:p.x+sigma*normal(),y:p.y+sigma*normal()};
+}
+
+
+const collapse = ids => ids.filter((id,i)=>!i || ids[i-1]!==id);
+
+function simulate({noise=32,interval=5,count=24,complexity=6,seed=42}={}) {
+  const frame=projection(12.97,77.59);
+  const nodes=[],edges=[],lookup=new Map();
+  const id=(x,y)=>x+':'+y;
+  function add(from,to) {
+    const edge={id:'R'+(edges.length+1),from,to};
+    edges.push(edge);
+    lookup.set(from+'>'+to,edge.id);
+  }
+  for(let y=0;y<complexity;y++) for(let x=0;x<complexity;x++) {
+    nodes.push({id:id(x,y),...frame.toGPS({x:100*x,y:65*y})});
+    if(x) add(id(x-1,y),id(x,y));
+    if(y) add(id(x,y-1),id(x,y));
+  }
+  const path=[id(0,1),id(1,1),id(2,1),id(2,2),id(3,2),id(4,2),id(4,3),id(4,4)];
+  for(let x=5;x<complexity;x++) path.push(id(x,4));
+  const network={nodes,edges};
+  const roads=new Roads(network);
+  const route=path.slice(1).map((node,i)=>roads.edges.get(lookup.get(path[i]+'>'+node)));
+  const total=route.reduce((sum,e)=>sum+e.length,0);
+  const normal=gaussian(seed);
+  const observations=[],truthPoints=[],truthIds=[];
+  for(let i=0;i<count;i++) {
+    let offset=total*i/(count-1), index=0;
+    while(index<route.length-1 && offset>=route[index].length-1e-7) offset-=route[index++].length;
+    const edge=route[index];
+    const loc=interpolate(edge.a,edge.b,Math.max(0,Math.min(1,offset/edge.length)));
+    const timestamp=new Date(Date.UTC(2026,0,1)+1000*i*interval).toISOString();
+    observations.push({timestamp,...roads.frame.toGPS(perturb(loc,noise,normal))});
+    truthPoints.push({timestamp,...roads.frame.toGPS(loc)});
+    truthIds.push(edge.id);
+  }
+  return {network,roads,observations,truthPoints,truthIds,truthRoute:route.map(e=>e.id),
+    truthGeometry:path.map(node=>roads.nodes.get(node)),truthDistance:total,noise};
+}
+
+function parseGPS(text) {
+  const lines=text.trim().split(/\r?\n/);
+  const header=lines.shift().replace(/^\uFEFF/,'').split(',').map(s=>s.trim().toLowerCase());
+  const indexes=['latitude','longitude','timestamp'].map(key=>header.indexOf(key));
+  if(indexes.includes(-1)) throw new Error('CSV requires latitude, longitude and timestamp columns.');
+  const rows=lines.filter(line=>line.trim()).map((line,i)=>{
+    const fields=line.split(',').map(s=>s.trim().replace(/^"|"$/g,''));
+    const [lat,lon,time]=indexes.map(j=>fields[j]);
+    const latitude=Number(lat),longitude=Number(lon);
+    const ms=/^\d{4}-\d\d-\d\dT.+(?:Z|[+-]\d\d:\d\d)$/i.test(time??'') ? Date.parse(time) : NaN;
+    if(!lat || !lon || !Number.isFinite(latitude) || !Number.isFinite(longitude)
+       || Math.abs(latitude)>=89 || Math.abs(longitude)>180 || !Number.isFinite(ms))
+      throw new Error('Invalid coordinate or ISO 8601 timestamp on data row '+(i+1)+'.');
+    return {latitude,longitude,timestamp:new Date(ms).toISOString()};
+  });
+  if(rows.length<2 || rows.length>1000) throw new Error('Provide 2 to 1,000 GPS fixes.');
+  if(rows.some((p,i)=>i && p.timestamp<=rows[i-1].timestamp))
+    throw new Error('GPS timestamps must be strictly increasing.');
+  return rows;
+}
+
+
+function transition(roads,a,b,observed,seconds,sigma) {
+  const connected=roads.connect(a,b).length;
+  const moved=Math.hypot(observed.x,observed.y);
+  const dx=b.xy.x-a.xy.x, dy=b.xy.y-a.xy.y;
+  const snapped=Math.hypot(dx,dy);
+  const headingWeight=Math.min(1,2*moved/sigma);
+  const heading=snapped>1 && moved>1 ? headingWeight*(1-(dx*observed.x+dy*observed.y)/(snapped*moved)) : 0;
+  const excessSpeed=Math.max(0,connected-45*seconds-2*sigma);
+  return Math.abs(connected-moved)/Math.max(5,0.55*sigma)+heading+excessSpeed/20;
+}
+
+function viterbi(roads,rows,xy,observations,sigma) {
+  const emission=c=>0.5*(c.error/sigma)**2;
+  let costs=rows[0].map(emission);
+  const pointers=[];
+  for(let i=1;i<rows.length;i++) {
+    // Estimate local velocity across several fixes to reduce noise inflation.
+    const radius=sigma>5?2:0;
+    const lo=Math.max(0,i-1-radius), hi=Math.min(xy.length-1,i+radius);
+    const span=Date.parse(observations[hi].timestamp)-Date.parse(observations[lo].timestamp);
+    const fraction=(Date.parse(observations[i].timestamp)-Date.parse(observations[i-1].timestamp))/span;
+    const observed={x:(xy[hi].x-xy[lo].x)*fraction,y:(xy[hi].y-xy[lo].y)*fraction};
+    const seconds=(Date.parse(observations[i].timestamp)-Date.parse(observations[i-1].timestamp))/1000;
+    const previous=[];
+    const next=rows[i].map(b=>{
+      let best=Infinity, index=-1;
+      rows[i-1].forEach((a,j)=>{
+        const cost=costs[j]+transition(roads,a,b,observed,seconds,sigma);
+        if(cost<best) { best=cost; index=j; }
+      });
+      previous.push(index);
+      return best+emission(b);
+    });
+    costs=next;
+    pointers.push(previous);
+  }
+  const score=Math.min(...costs);
+  if(!Number.isFinite(score)) throw new Error('No connected path through the candidate roads.');
+  let index=costs.indexOf(score);
+  const matches=[rows.at(-1)[index]];
+  for(let i=rows.length-2;i>=0;i--) {
+    index=pointers[i][index];
+    matches.push(rows[i][index]);
+  }
+  return {matches:matches.reverse(),cost:score};
+}
+
+function match(roads,observations,{algorithm='hmm',sigma=25,k=8}={}) {
+  if(!['nearest','hmm'].includes(algorithm) || observations.length<2 || !(sigma>0) || !Number.isInteger(k) || k<1)
+    throw new Error('Invalid matching options or trajectory.');
+  const start=performance.now();
+  const xy=observations.map(roads.frame.toXY);
+  const rows=xy.map(p=>roads.candidates(p,algorithm==='nearest'?1:k));
+  const {matches,cost=null}=algorithm==='nearest'
+    ? {matches:rows.map(r=>r[0])} : viterbi(roads,rows,xy,observations,sigma);
+  const segments=[],parts=[[matches[0].xy]];
+  let length=0,gaps=0;
+  for(let i=1;i<matches.length;i++) {
+    const leg=roads.connect(matches[i-1],matches[i],true);
+    if(!Number.isFinite(leg.length)) {
+      gaps++;
+      parts.push([matches[i].xy]);
+      segments.push(null);
+      continue;
+    }
+    parts.at(-1).push(...leg.points.slice(1));
+    segments.push(...leg.edges);
+    length+=leg.length;
+  }
+  return {algorithm,matches,segments:collapse(segments),parts,length,gaps,cost,ms:performance.now()-start};
+}
+
+
+
+function editDistance(a,b) {
+  let row=Array.from({length:b.length+1},(_,i)=>i);
+  for(let i=0;i<a.length;i++) {
+    const next=[i+1];
+    for(let j=0;j<b.length;j++) {
+      next.push(Math.min(row[j+1]+1,next[j]+1,row[j]+Number(a[i]!==b[j])));
+    }
+    row=next;
+  }
+  return row.at(-1);
+}
+
+function evaluate(data,result) {
+  const metrics={
+    residual:result.matches.reduce((sum,p)=>sum+p.error,0)/result.matches.length,
+    distance:result.length,ms:result.ms,gaps:result.gaps
+  };
+  if(!data.truthRoute) return metrics;
+  const predicted=new Set(result.segments.filter(id=>id!==null));
+  const truth=new Set(data.truthRoute);
+  const overlap=[...truth].filter(id=>predicted.has(id)).length;
+  return {...metrics,
+    point:100*result.matches.filter((p,i)=>p.edge.id===data.truthIds[i]).length/result.matches.length,
+    recall:100*overlap/truth.size,
+    precision:predicted.size?100*overlap/predicted.size:0,
+    similarity:100*(1-editDistance(data.truthRoute,result.segments)/Math.max(data.truthRoute.length,result.segments.length)),
+    exact:Number(result.gaps===0 && JSON.stringify(data.truthRoute)===JSON.stringify(result.segments))*100
+  };
+}
+
+function compare(data) {
+  return ['nearest','hmm'].map(algorithm=>{
+    // Independent cold graph caches so neither algorithm gets precomputed routes.
+    const result=match(new Roads(data.network),data.observations,{algorithm,sigma:Math.max(3,data.noise)});
+    return {result,metrics:evaluate(data,result)};
+  });
+}
+
+function benchmark({noise=32,complexity=6,seed=42,trials=10}={}) {
+  const rows=[];
+  for(const [axis,levels] of [['noise',[0,10,20,30,45,60,80]],['interval',[2,4,6,10,15,30]]]) {
+    for(const level of levels) {
+      const interval=axis==='interval'?level:6;
+      const sigma=axis==='noise'?level:noise;
+      const tallies={nearest:{},hmm:{}};
+      for(let i=0;i<trials;i++) {
+        const data=simulate({noise:sigma,interval,count:120/interval+1,complexity,seed:seed+i});
+        for(const {result,metrics} of compare(data)) {
+          const tally=tallies[result.algorithm];
+          for(const [key,value] of Object.entries(metrics)) tally[key]=(tally[key]??0)+value/trials;
+        }
+      }
+      for(const [algorithm,metrics] of Object.entries(tallies))
+        rows.push({axis,level,algorithm,trials,noise:sigma,interval,...metrics});
+    }
+  }
+  return rows;
+}
+
+function fixRows(data,results) {
+  return data.observations.map((p,i)=>{
+    const truth=data.truthPoints?.[i];
+    const row={...p,truth_latitude:truth?.latitude,truth_longitude:truth?.longitude,truth_segment:data.truthIds?.[i]};
+    for(const {result} of results) {
+      const fix=result.matches[i], prefix=result.algorithm;
+      const gps=data.roads.frame.toGPS(fix.xy);
+      Object.assign(row,{[prefix+'_segment']:fix.edge.id,[prefix+'_latitude']:gps.latitude,
+        [prefix+'_longitude']:gps.longitude,[prefix+'_residual_m']:fix.error});
+    }
+    return row;
+  });
+}
+
+function csv(rows) {
+  const keys=Object.keys(rows[0]);
+  const cell=value=>{
+    const text=String(value??'');
+    return /[",\r\n]/.test(text)?'"'+text.replaceAll('"','""')+'"':text;
+  };
+  return [keys.join(','),...rows.map(row=>keys.map(key=>cell(row[key])).join(','))].join('\n')+'\n';
+}
+
+function routeReport(data,results) {
+  return {
+    groundTruth:data.truthRoute?{segments:data.truthRoute,distance_m:data.truthDistance,
+      geometry:data.truthGeometry.map(data.roads.frame.toGPS)}:null,
+    methods:results.map(({result,metrics})=>({
+      algorithm:result.algorithm,segments:result.segments,metrics,pathCost:result.cost,
+      geometryParts:result.parts.map(part=>part.map(data.roads.frame.toGPS))
+    }))
+  };
+}
+
+const ns='http://www.w3.org/2000/svg';
+const palette={truth:'#158463',raw:'#ba4b2d',nearest:'#8256bd',hmm:'#1664cb'};
+const W=860,H=440;
+function svg(tag,attrs={},content) {
+  const node=document.createElementNS(ns,tag);
+  for(const [key,value] of Object.entries(attrs)) node.setAttribute(key,value);
+  if(content!==undefined) node.textContent=content;
+  return node;
+}
+
+function drawMap(root,data,results,layers,selected,onSelect) {
+  root.replaceChildren();
+  const raw=data.observations.map(data.roads.frame.toXY);
+  const points=[...data.roads.nodes.values(),...raw];
+  const xs=points.map(p=>p.x),ys=points.map(p=>p.y);
+  const left=Math.min(...xs),right=Math.max(...xs),bottom=Math.min(...ys),top=Math.max(...ys);
+  const scale=Math.min((W-74)/Math.max(1,right-left),(H-74)/Math.max(1,top-bottom));
+  const x=p=>W/2+(p.x-(left+right)/2)*scale;
+  const y=p=>H/2-(p.y-(bottom+top)/2)*scale;
+  function trace(points,color,width,dash='none',arrows=false) {
+    root.append(svg('polyline',{points:points.map(p=>x(p)+','+y(p)).join(' '),fill:'none',
+      stroke:color,'stroke-width':width,'stroke-linejoin':'round','stroke-linecap':'round','stroke-dasharray':dash}));
+    if(!arrows) return;
+    for(let i=1;i<points.length;i++) {
+      const a=points[i-1],b=points[i];
+      const dx=x(b)-x(a),dy=y(b)-y(a);
+      if(Math.hypot(dx,dy)<23) continue;
+      root.append(svg('path',{d:'M -5 -4 L 3 0 L -5 4',fill:'none',stroke:color,'stroke-width':2,
+        transform:'translate('+((x(a)+x(b))/2)+' '+((y(a)+y(b))/2)+') rotate('+Math.atan2(dy,dx)*180/Math.PI+')'}));
+    }
+  }
+  if(layers.roads) for(const edge of data.roads.edges.values()) trace([edge.a,edge.b],'#d4dde0',3);
+  if(layers.truth && data.truthGeometry) trace(data.truthGeometry,palette.truth,10,'none',true);
+  for(const {result} of results) {
+    const key=result.algorithm;
+    if(layers[key]) for(const part of result.parts) trace(part,palette[key],key==='hmm'?3:5,key==='nearest'?'8 6':'none',true);
+  }
+  if(layers.residual) for(const {result} of results) {
+    if(!layers[result.algorithm]) continue;
+    result.matches.forEach((c,i)=>trace([raw[i],c.xy],i===selected?palette[result.algorithm]:'#91a1a9',i===selected?2:1,'3 4'));
+  }
+  if(layers.raw) {
+    trace(raw,palette.raw,1.5,'3 4',true);
+    raw.forEach((p,i)=>{
+      const dot=svg('circle',{cx:x(p),cy:y(p),r:i===selected?7:4.5,fill:palette.raw,
+        stroke:'white','stroke-width':1.5,tabindex:0,role:'button','aria-label':'Inspect GPS fix '+(i+1)});
+      dot.append(svg('title',{},'Fix '+(i+1)+' · '+data.observations[i].timestamp));
+      dot.addEventListener('click',()=>onSelect(i));
+      dot.addEventListener('keydown',event=>{if(['Enter',' '].includes(event.key)) {event.preventDefault();onSelect(i);}});
+      root.append(dot);
+      if(i===selected || i===0 || i===raw.length-1)
+        root.append(svg('text',{x:x(p)+9,y:y(p)-7,fill:palette.raw,'font-size':12,'font-weight':700},i+1));
+    });
+  }
+  root.append(svg('text',{x:24,y:414,fill:'#52646a','font-size':12},'↑ North'));
+  root.append(svg('line',{x1:85,y1:410,x2:85+50*scale,y2:410,stroke:'#52646a','stroke-width':2}));
+  root.append(svg('text',{x:92+50*scale,y:414,fill:'#52646a','font-size':12},'50 m'));
+}
+
+function metricChart(root,rows,axis,key) {
+  root.replaceChildren();
+  const data=rows.filter(r=>r.axis===axis);
+  const max=Math.max(...data.map(r=>r.level)),min=Math.min(...data.map(r=>r.level));
+  const x=value=>53+(value-min)/(max-min)*305;
+  const y=value=>164-value*1.41;
+  for(const tick of [0,25,50,75,100]) {
+    root.append(svg('line',{x1:49,y1:y(tick),x2:365,y2:y(tick),stroke:'#dce4e6'}));
+    root.append(svg('text',{x:43,y:y(tick)+4,'text-anchor':'end',fill:'#52646a','font-size':10},tick+'%'));
+  }
+  for(const level of new Set(data.map(r=>r.level)))
+    root.append(svg('text',{x:x(level),y:183,'text-anchor':'middle',fill:'#52646a','font-size':10},level));
+  for(const method of ['nearest','hmm']) {
+    const series=data.filter(r=>r.algorithm===method);
+    root.append(svg('polyline',{points:series.map(r=>x(r.level)+','+y(r[key])).join(' '),
+      fill:'none',stroke:palette[method],'stroke-width':2.5,'stroke-dasharray':method==='nearest'?'5 3':'none'}));
+    for(const row of series) {
+      const circle=svg('circle',{cx:x(row.level),cy:y(row[key]),r:4,fill:palette[method]});
+      circle.append(svg('title',{},method+' · '+row[key].toFixed(1)+'%'));
+      root.append(circle);
+    }
+  }
+}
+
+
+const $=id=>document.getElementById(id);
+const settings=()=>Object.fromEntries([...new FormData($('settings'))].map(([key,value])=>[key,Number(value)]));
+const names={nearest:'Nearest road',hmm:'Context-aware HMM'};
+const labels={point:'Point accuracy (%)',similarity:'Ordered route similarity (%)',recall:'Segment recall (%)',
+  precision:'Segment precision (%)',exact:'Exact route (%)',residual:'Mean GPS residual (m)',
+  distance:'Route distance (m)',gaps:'Disconnected gaps',ms:'Runtime (ms)'};
+let data,results=[],selected=0,sweep=[];
+
+function table(root,headers,rows) {
+  const elem=document.createElement('table');
+  const header=elem.createTHead().insertRow();
+  for(const value of headers) {
+    const cell=document.createElement('th');
+    cell.scope='col';
+    cell.textContent=value;
+    header.append(cell);
+  }
+  const body=elem.createTBody();
+  rows.forEach(row=>{
+    const tr=body.insertRow();
+    row.forEach(value=>tr.insertCell().textContent=value);
+  });
+  root.replaceChildren(elem);
+}
+const fmt=(n,places=1)=>Number.isFinite(n)?n.toFixed(places):'—';
+
+function selectFix(index) {
+  selected=index;
+  $('fix').value=index+1;
+  $('fix').max=data.observations.length;
+  const fix=data.observations[index];
+  const details=results.map(({result})=>names[result.algorithm]+' '+result.matches[index].edge.id+
+    ' ('+fmt(result.matches[index].error)+' m)');
+  if(data.truthIds) details.unshift('Truth '+data.truthIds[index]);
+  $('fix-info').textContent=['Fix '+(index+1),fix.timestamp,fmt(fix.latitude,6)+', '+fmt(fix.longitude,6),...details].join(' · ');
+  const layers=Object.fromEntries([...$('layers').querySelectorAll('input')].map(el=>[el.name,el.checked]));
+  drawMap($('map'),data,results,layers,selected,selectFix);
+}
+
+function render() {
+  $('map-meta').textContent=data.observations.length+' fixes · '+data.roads.edges.size+' road segments · '+
+    (data.truthRoute?'Simulated trip':'Imported trip');
+  $('export').disabled=!results.length;
+  $('metrics').textContent='';
+  $('routes').replaceChildren();
+  if(results.length) {
+    table($('metrics'),['Metric',...results.map(({result})=>names[result.algorithm])],
+      Object.entries(labels).filter(([key])=>results.some(r=>key in r.metrics))
+        .map(([key,label])=>[label,...results.map(r=>fmt(r.metrics[key],key==='ms'?2:key==='gaps'?0:1))]));
+  }
+  function route(label,ids,length) {
+    const p=document.createElement('p');
+    const name=document.createElement('strong');
+    name.textContent=label+' · '+fmt(length)+' m · ';
+    p.append(name,ids.map(id=>id??'gap').join(' → ') || 'no traversed road');
+    $('routes').append(p);
+  }
+  if(data.truthRoute) route('Ground truth',data.truthRoute,data.truthDistance);
+  results.forEach(({result})=>route(names[result.algorithm],result.segments,result.length));
+  const rows=fixRows(data,results);
+  const headers=Object.keys(rows[0]);
+  table($('fix-table'),['Fix',...headers.map(h=>h.replaceAll('_',' '))],
+    rows.map((row,i)=>[i+1,...headers.map(h=>typeof row[h]==='number'?fmt(row[h],h.endsWith('_m')?2:6):row[h]??'—')]));
+  selectFix(selected);
+}
+
+function setData(next,message) {
+  data=next;
+  selected=0;
+  results=[];
+  $('status').textContent=message;
+  render();
+}
+
+function run() {
+  const algorithm=$('method').value;
+  const sigma=Math.max(3,data.truthRoute?data.noise:settings().noise);
+  try {
+    if(algorithm==='both') {
+      // Recover the baseline even if the HMM cannot connect the imported fixes.
+      if(data.truthRoute) results=compare(data);
+      else {
+        const nearest=match(new Roads(data.network),data.observations,{algorithm:'nearest',sigma});
+        results=[{result:nearest,metrics:evaluate(data,nearest)}];
+        const hmm=match(new Roads(data.network),data.observations,{algorithm:'hmm',sigma});
+        results.push({result:hmm,metrics:evaluate(data,hmm)});
+      }
+    } else {
+      results=[];
+      const result=match(new Roads(data.network),data.observations,{algorithm,sigma});
+      results=[{result,metrics:evaluate(data,result)}];
+    }
+    $('status').textContent='Matching complete.';
+  } catch(error) {
+    $('status').textContent=error.message;
+  }
+  render();
+}
+
+function download(filename,content,type) {
+  const url=URL.createObjectURL(new Blob([content],{type}));
+  const link=document.createElement('a');
+  link.href=url;
+  link.download=filename;
+  link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+$('settings').addEventListener('submit',event=>{
+  event.preventDefault();
+  setData(simulate(settings()),'Trajectory generated. Run map matching to compare.');
+});
+$('load').addEventListener('click',async()=>{
+  try {
+    const gps=$('gps-file').files[0],road=$('road-file').files[0];
+    if(!gps || !road) throw new Error('Choose both a GPS CSV and a road JSON file.');
+    const network=JSON.parse((await road.text()).replace(/^\uFEFF/,''));
+    const roads=new Roads(network);
+    const observations=parseGPS(await gps.text());
+    setData({network,roads,observations},'Loaded. GPS noise is used as the HMM error estimate.');
+  } catch(error) { $('status').textContent=error.message; }
+});
+$('run').addEventListener('click',()=>{if($('settings').reportValidity()) run();});
+$('layers').addEventListener('change',()=>selectFix(selected));
+$('fix').addEventListener('input',event=>selectFix(Number(event.target.value)-1));
+$('export').addEventListener('click',()=>download('matched-trajectory.json',JSON.stringify({
+  ...routeReport(data,results),fixes:fixRows(data,results)},null,2),'application/json'));
+
+function charts() {
+  $('charts').hidden=false;
+  for(const axis of ['noise','interval']) metricChart($(axis+'-chart'),sweep,axis,$('chart-metric').value);
+}
+$('benchmark').addEventListener('click',()=>{
+  if(!$('settings').reportValidity()) return;
+  $('benchmark').disabled=true;
+  $('experiment-status').textContent='Running 130 paired trials…';
+  const workerURL=URL.createObjectURL(new Blob([workerSource],{type:'text/javascript'}));
+  const worker=new Worker(workerURL);
+  const terminate=worker.terminate.bind(worker);
+  worker.terminate=()=>{terminate();URL.revokeObjectURL(workerURL);};
+  function stop(message) {
+    $('experiment-status').textContent=message;
+    $('benchmark').disabled=false;
+    worker.terminate();
+  }
+  worker.onmessage=({data:response})=>{
+    if(response.error) {stop(response.error);return;}
+    sweep=response.rows;
+    charts();
+    stop('130 paired trials complete.');
+  };
+  worker.onerror=()=>stop('The experiment worker could not start. Serve the app over HTTP.');
+  worker.postMessage(settings());
+});
+$('chart-metric').addEventListener('change',charts);
+$('export-benchmark').addEventListener('click',()=>download('benchmark.csv',csv(sweep),'text/csv'));
+
+setData(simulate(settings()),'');
+run();
+
+</script>
+</head>
+<body>
+<header><div class="brand">PATHSNAP <span>GPS RESEARCH LAB</span></div><h1>GPS Trajectory Map Matching<br>and Route Recovery</h1><p>Trace noisy GPS fixes back to a connected road network.</p></header>
+<main>
+<div class="workspace">
+<aside class="card">
+<h2>Trajectory settings</h2>
+<form id="settings">
+<label>GPS noise σ (m)<input name="noise" type="number" min="0" max="150" step="1" value="32" required></label>
+<label>Sampling interval (s)<input name="interval" type="number" min="1" max="120" value="5" required></label>
+<label>Number of observations<input name="count" type="number" min="2" max="300" value="24" required></label>
+<label>Road network<select name="complexity"><option value="5">Compact · 5 × 5</option><option value="6" selected>Standard · 6 × 6</option><option value="9">Dense · 9 × 9</option></select></label>
+<label>Random seed<input name="seed" type="number" min="0" max="4294967285" value="42" required></label>
+<button class="secondary" type="submit">Generate trajectory</button>
+</form>
+<details><summary>Load GPS and roads</summary>
+<label>GPS CSV<input id="gps-file" type="file" accept=".csv,text/csv"></label>
+<label>Road network JSON<input id="road-file" type="file" accept=".json,application/json"></label>
+<button class="secondary" id="load">Load files</button>
+</details>
+<label class="method">Matching algorithm<select id="method"><option value="both">Compare both algorithms</option><option value="nearest">Nearest road</option><option value="hmm">Context-aware HMM</option></select></label>
+<button class="primary" id="run">Run map matching</button>
+<p id="status" role="status"></p>
+</aside>
+<section class="card map-card">
+<div class="split"><div><h2>Trajectory map</h2><p id="map-meta"></p></div><button class="secondary" id="export">Export matches</button></div>
+<div id="layers" class="layers">
+<label><input type="checkbox" name="roads" checked><i class="roads"></i> Roads</label>
+<label><input type="checkbox" name="truth" checked><i class="truth"></i> Ground truth</label>
+<label><input type="checkbox" name="raw" checked><i class="raw"></i> GPS fixes</label>
+<label><input type="checkbox" name="nearest" checked><i class="nearest"></i> Nearest</label>
+<label><input type="checkbox" name="hmm" checked><i class="hmm"></i> HMM</label>
+<label><input type="checkbox" name="residual"><i class="residual"></i> GPS residuals</label>
+</div>
+<svg id="map" viewBox="0 0 860 440" role="group" aria-label="Trajectory and road layers"></svg>
+<div class="inspect"><label>Inspect fix <input type="range" id="fix" min="1" value="1"></label><p id="fix-info"></p></div>
+</section>
+</div>
+<section class="card results"><h2>Matching results</h2><div id="metrics" class="scroll"></div><div id="routes"></div><details><summary>View all GPS fixes and matches</summary><div id="fix-table" class="scroll"></div></details></section>
+<section class="card experiments">
+<div class="split"><div><h2>Noise and sampling experiments</h2><p>Ten paired trials per setting on a fixed two-minute route.</p></div><button class="primary" id="benchmark">Run experiments</button></div>
+<p id="experiment-status" role="status"></p>
+<div id="charts" hidden><div class="split"><div class="layers"><span><i class="nearest"></i> Nearest</span><span><i class="hmm"></i> HMM</span></div><label>Chart metric <select id="chart-metric"><option value="similarity">Ordered route similarity</option><option value="point">Point accuracy</option><option value="recall">Segment recall</option><option value="exact">Exact route rate</option></select></label></div>
+<div class="chart-grid"><div><h3>GPS noise σ (m)</h3><svg id="noise-chart" viewBox="0 0 390 190" aria-label="Accuracy versus noise" role="img"></svg></div><div><h3>Sampling interval (s)</h3><svg id="interval-chart" viewBox="0 0 390 190" aria-label="Accuracy versus interval" role="img"></svg></div></div>
+<button class="secondary" id="export-benchmark">Export experiment CSV</button></div>
+</section>
+</main>
+</body>
+</html>

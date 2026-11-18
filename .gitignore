@@ -1,0 +1,24 @@
+# Node / tooling
+node_modules/
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local editor files
+.vscode/
+.idea/
+
+# Generated temporary files
+*.log
