@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS Trajectory Map Matching and Route Recovery</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="src/ui.js"></script>
+</head>
+<body>
+<header><div class="brand">PATHSNAP <span>GPS RESEARCH LAB</span></div><h1>GPS Trajectory Map Matching<br>and Route Recovery</h1><p>Trace noisy GPS fixes back to a connected road network.</p></header>
+<main>
+<div class="workspace">
+<aside class="card">
+<h2>Trajectory settings</h2>
+<form id="settings">
+<label>GPS noise σ (m)<input name="noise" type="number" min="0" max="150" step="1" value="32" required></label>
+<label>Sampling interval (s)<input name="interval" type="number" min="1" max="120" value="5" required></label>
+<label>Number of observations<input name="count" type="number" min="2" max="300" value="24" required></label>
+<label>Road network<select name="complexity"><option value="5">Compact · 5 × 5</option><option value="6" selected>Standard · 6 × 6</option><option value="9">Dense · 9 × 9</option></select></label>
+<label>Random seed<input name="seed" type="number" min="0" max="4294967285" value="42" required></label>
+<button class="secondary" type="submit">Generate trajectory</button>
+</form>
+<details><summary>Load GPS and roads</summary>
+<label>GPS CSV<input id="gps-file" type="file" accept=".csv,text/csv"></label>
+<label>Road network JSON<input id="road-file" type="file" accept=".json,application/json"></label>
+<button class="secondary" id="load">Load files</button>
+</details>
+<label class="method">Matching algorithm<select id="method"><option value="both">Compare both algorithms</option><option value="nearest">Nearest road</option><option value="hmm">Context-aware HMM</option></select></label>
+<button class="primary" id="run">Run map matching</button>
+<p id="status" role="status"></p>
+</aside>
+<section class="card map-card">
+<div class="split"><div><h2>Trajectory map</h2><p id="map-meta"></p></div><button class="secondary" id="export">Export matches</button></div>
+<div id="layers" class="layers">
+<label><input type="checkbox" name="roads" checked><i class="roads"></i> Roads</label>
+<label><input type="checkbox" name="truth" checked><i class="truth"></i> Ground truth</label>
+<label><input type="checkbox" name="raw" checked><i class="raw"></i> GPS fixes</label>
+<label><input type="checkbox" name="nearest" checked><i class="nearest"></i> Nearest</label>
+<label><input type="checkbox" name="hmm" checked><i class="hmm"></i> HMM</label>
+<label><input type="checkbox" name="residual"><i class="residual"></i> GPS residuals</label>
+</div>
+<svg id="map" viewBox="0 0 860 440" role="group" aria-label="Trajectory and road layers"></svg>
+<div class="inspect"><label>Inspect fix <input type="range" id="fix" min="1" value="1"></label><p id="fix-info"></p></div>
+</section>
+</div>
+<section class="card results"><h2>Matching results</h2><div id="metrics" class="scroll"></div><div id="routes"></div><details><summary>View all GPS fixes and matches</summary><div id="fix-table" class="scroll"></div></details></section>
+<section class="card experiments">
+<div class="split"><div><h2>Noise and sampling experiments</h2><p>Ten paired trials per setting on a fixed two-minute route.</p></div><button class="primary" id="benchmark">Run experiments</button></div>
+<p id="experiment-status" role="status"></p>
+<div id="charts" hidden><div class="split"><div class="layers"><span><i class="nearest"></i> Nearest</span><span><i class="hmm"></i> HMM</span></div><label>Chart metric <select id="chart-metric"><option value="similarity">Ordered route similarity</option><option value="point">Point accuracy</option><option value="recall">Segment recall</option><option value="exact">Exact route rate</option></select></label></div>
+<div class="chart-grid"><div><h3>GPS noise σ (m)</h3><svg id="noise-chart" viewBox="0 0 390 190" aria-label="Accuracy versus noise" role="img"></svg></div><div><h3>Sampling interval (s)</h3><svg id="interval-chart" viewBox="0 0 390 190" aria-label="Accuracy versus interval" role="img"></svg></div></div>
+<button class="secondary" id="export-benchmark">Export experiment CSV</button></div>
+</section>
+</main>
+</body>
+</html>

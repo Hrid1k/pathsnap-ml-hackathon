@@ -1,11 +1,28 @@
-.venv/
-__pycache__/
-*.pyc
+# Node / tooling
+node_modules/
+npm-debug.log*
 .DS_Store
-.env
-*.log
-*.tmp
-data/
+Thumbs.db
+
+# Python environments and caches
+.venv/
+venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local editor files
+.vscode/
+.idea/
+
+# Generated temporary files
+*.log
+
+# PathSnap ML project data and generated maps
+data/
 experiments/pathsnap_trip_00000000.html
