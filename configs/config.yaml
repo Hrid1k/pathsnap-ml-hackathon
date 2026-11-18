@@ -1,0 +1,15 @@
+data_root: data
+candidate_k: 8
+random_seed: 42
+models:
+  logistic: balanced logistic regression
+  random_forest: 120 trees, depth 14
+  extra_trees: 140 trees, depth 16
+  hist_gradient_boosting: 160 iterations, 31 leaves
+  mlp: 48-24 hidden layers
+bayesian:
+  trials: 12
+  objective: group-aware CV macro F1
+hmm:
+  disconnected_penalty: 5.0
+  gap_penalty: 2.0
